@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <BluetoothSerial.h>
 #include <esp_bt.h>
+#include <esp_task_wdt.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <WiFiClientSecure.h>
@@ -33,6 +34,7 @@ volatile bool btOk = false;
 volatile uint32_t nLines = 0, nSent = 0, nFail = 0;
 volatile bool ntpDone = false;
 String uploading;  // arquivo em envio (nao apagar)
+String denySfx;    // sufixo do dongle a ignorar (DONGLE_DENY ou comando remoto)
 
 // ------------------------------------------------------------------ fila
 File cur;
@@ -194,6 +196,7 @@ int uploadBatch(int maxFiles) {
     uploading = f;
     xSemaphoreGive(fsMux);
     if (!f.length()) break;
+    esp_task_wdt_reset();
     if (!appendFile(f)) {
       nFail++;
       uploading = "";
@@ -250,35 +253,85 @@ String elm(const char* c, uint32_t to = 1500) {
   return "TIMEOUT";
 }
 
+// Dongle ELM327 mini "OBDII": so Bluetooth classico (SPP), pareamento legado por PIN.
+// No comboio ha dois dongles com o MESMO nome, um em cada carro. Regras:
+//  - DONGLE_DENY (sufixo do endereco, ex. "22:33") nunca e usado: e o dongle do outro carro;
+//  - entre os candidatos, tenta primeiro o de sinal mais forte (o do proprio carro);
+//  - o primeiro que responder fica salvo; segurar o botao BOOT ao ligar esquece o salvo.
+#ifndef DONGLE_DENY
+#define DONGLE_DENY ""
+#endif
+static const char* PINS_BT[] = {"1234", "0000", "6789"};
+
+static String addrStr(const uint8_t* a) {
+  char b[18];
+  snprintf(b, sizeof b, "%02X:%02X:%02X:%02X:%02X:%02X", a[0], a[1], a[2], a[3], a[4], a[5]);
+  return b;
+}
+static bool denied(const uint8_t* a) {
+  String d = denySfx;
+  d.toUpperCase();
+  return d.length() && addrStr(a).endsWith(d);
+}
+static bool tryAddr(uint8_t* a) {
+  for (auto pin : PINS_BT) {
+    esp_task_wdt_reset();
+    BT.setPin(pin);
+    Serial.printf("[bt] conectando %s (PIN %s)...\n", addrStr(a).c_str(), pin);
+    if (BT.connect(a)) {
+      char nm[20];
+      snprintf(nm, sizeof nm, "dongle_%02X%02X", a[4], a[5]);
+      record("evento", nm, 0, false);
+      return true;
+    }
+  }
+  return false;
+}
+
 bool btConnect() {
   uint8_t addr[6];
   // endereco salvo de uma conexao anterior: tenta direto
-  if (prefs.getBytes("obdaddr", addr, 6) == 6) {
-    Serial.println("[bt] conectando ao dongle salvo...");
-    if (BT.connect(addr)) return true;
+  if (prefs.getBytes("obdaddr", addr, 6) == 6 && !denied(addr)) {
+    if (tryAddr(addr)) return true;
   }
-  Serial.println("[bt] procurando dongle (8 s)...");
-  BTScanResults* r = BT.discover(8000);
-  if (r) {
-    for (int i = 0; i < r->getCount(); i++) {
-      BTAdvertisedDevice* d = r->getDevice(i);
-      String n = d->getName().c_str();
-      String u = n;
-      u.toUpperCase();
-      Serial.printf("[bt]  %s  %s\n", d->getAddress().toString().c_str(), n.c_str());
-      if (u.indexOf("OBD") >= 0 || u.indexOf("ELM") >= 0 || u.indexOf("V-LINK") >= 0 ||
-          u.indexOf("VLINK") >= 0 || u.indexOf("VGATE") >= 0 || n == OBD_NAME) {
-        BTAddress a = d->getAddress();
-        memcpy(addr, *a.getNative(), 6);
-        if (BT.connect(addr)) {
-          prefs.putBytes("obdaddr", addr, 6);
-          return true;
-        }
-      }
+  Serial.println("[bt] procurando dongle (10 s)...");
+  BTScanResults* r = BT.discover(10000);
+  if (!r) return false;
+  // candidatos com nome de dongle, do sinal mais forte para o mais fraco
+  int idx[16], rssi[16], n = 0;
+  for (int i = 0; i < r->getCount() && n < 16; i++) {
+    BTAdvertisedDevice* d = r->getDevice(i);
+    String nmv = d->getName().c_str();
+    String u = nmv;
+    u.toUpperCase();
+    int rs = d->haveRSSI() ? d->getRSSI() : -127;
+    Serial.printf("[bt]  %s  %s  %d dBm\n", d->getAddress().toString().c_str(), nmv.c_str(), rs);
+    if (u.indexOf("OBD") >= 0 || u.indexOf("ELM") >= 0 || u.indexOf("V-LINK") >= 0 || u.indexOf("VLINK") >= 0 ||
+        nmv == OBD_NAME) {
+      idx[n] = i;
+      rssi[n] = rs;
+      n++;
     }
   }
-  Serial.printf("[bt] tentando pelo nome %s...\n", OBD_NAME);
-  return BT.connect(String(OBD_NAME));
+  for (int a = 0; a < n; a++)
+    for (int b = a + 1; b < n; b++)
+      if (rssi[b] > rssi[a]) {
+        std::swap(rssi[a], rssi[b]);
+        std::swap(idx[a], idx[b]);
+      }
+  for (int k = 0; k < n; k++) {
+    BTAddress ad = r->getDevice(idx[k])->getAddress();
+    memcpy(addr, *ad.getNative(), 6);
+    if (denied(addr)) {
+      Serial.printf("[bt] %s e o dongle do outro carro, pulei\n", addrStr(addr).c_str());
+      continue;
+    }
+    if (tryAddr(addr)) {
+      prefs.putBytes("obdaddr", addr, 6);
+      return true;
+    }
+  }
+  return false;
 }
 #endif
 
@@ -475,6 +528,17 @@ void setup() {
   pinMode(LED, OUTPUT);
   fsMux = xSemaphoreCreateMutex();
   prefs.begin("comboio", false);
+  // botao BOOT (GPIO0) segurado ao ligar: esquece o dongle salvo
+  pinMode(0, INPUT_PULLUP);
+  delay(50);
+  if (digitalRead(0) == LOW) {
+    prefs.remove("obdaddr");
+    for (int i = 0; i < 10; i++) {
+      digitalWrite(LED, i % 2);
+      delay(100);
+    }
+    Serial.println("[bt] dongle salvo esquecido (BOOT)");
+  }
   bootNo = prefs.getUInt("boot", 0) + 1;
   prefs.putUInt("boot", bootNo);
   uint8_t m[6];
@@ -511,6 +575,9 @@ void setup() {
   logWifi();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   xTaskCreatePinnedToCore(wifiTask, "wifi", 6144, nullptr, 1, nullptr, 0);
+  // vigia: o laco principal tem 240 s para dar sinal de vida; travou -> reinicia (a fila fica na flash)
+  esp_task_wdt_init(240, true);
+  esp_task_wdt_add(nullptr);
   Serial2.setRxBufferSize(1024);
   Serial2.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
   xTaskCreatePinnedToCore(gpsTask, "gps", 6144, nullptr, 2, nullptr, 0);
@@ -528,7 +595,74 @@ int timeouts = 0;
 #ifndef UPLOAD_EVERY_S
 #define UPLOAD_EVERY_S 180
 #endif
-const uint32_t UPLOAD_EVERY_MS = UPLOAD_EVERY_S * 1000UL;  // pausa o BT e envia
+uint32_t UPLOAD_EVERY_MS = UPLOAD_EVERY_S * 1000UL;  // pausa o BT e envia (comando remoto "every")
+
+// ------------------------------------------------------------------ comandos remotos
+// O ESP le cmd/<mac>.txt no Azure a cada envio (saida pela Starlink, sem porta aberta).
+// Formato: primeira linha "id=N" (so executa N maior que o ultimo), depois um comando por linha:
+//   every <s>   intervalo de envio em segundos (30..900), fica salvo
+//   deny <xx:yy>  sufixo de endereco de dongle a ignorar, fica salvo ("deny -" limpa)
+//   forget      esquece o dongle salvo
+//   reboot      reinicia
+void fetchCommands() {
+  WiFiClientSecure cli;
+  cli.setInsecure();
+  HTTPClient h;
+  h.setTimeout(10000);
+  String url = String("https://") + AZ_ACCOUNT + ".blob.core.windows.net/comboio/cmd/" + macTag + ".txt?" + AZ_CMD_SAS;
+  if (!h.begin(cli, url)) return;
+  h.addHeader("x-ms-version", "2021-08-06");
+  int code = h.GET();
+  String body = code == 200 ? h.getString() : "";
+  h.end();
+  if (code != 200) return;  // 404 = nenhum comando
+  int nl = body.indexOf('\n');
+  String first = nl < 0 ? body : body.substring(0, nl);
+  first.trim();
+  if (!first.startsWith("id=")) return;
+  uint32_t id = first.substring(3).toInt();
+  if (id <= prefs.getUInt("cmdid", 0)) return;
+  prefs.putUInt("cmdid", id);
+  bool doReboot = false;
+  int pos = nl < 0 ? body.length() : nl + 1;
+  while (pos < (int)body.length()) {
+    int e = body.indexOf('\n', pos);
+    if (e < 0) e = body.length();
+    String c = body.substring(pos, e);
+    c.trim();
+    pos = e + 1;
+    if (!c.length()) continue;
+    Serial.printf("[cmd] %u: %s\n", (unsigned)id, c.c_str());
+    if (c.startsWith("every ")) {
+      uint32_t s = constrain(c.substring(6).toInt(), 30, 900);
+      prefs.putUInt("every", s);
+      UPLOAD_EVERY_MS = s * 1000UL;
+      record("cmd", "every", s);
+    } else if (c.startsWith("deny ")) {
+      String d = c.substring(5);
+      d.trim();
+      if (d == "-") d = "";
+      prefs.putString("deny", d);
+      denySfx = d;
+      record("cmd", "deny", d.length());
+    } else if (c == "forget") {
+      prefs.remove("obdaddr");
+      record("cmd", "forget", 0, false);
+    } else if (c == "reboot") {
+      doReboot = true;
+    } else {
+      record("cmd", "desconhecido", 0, false);
+    }
+  }
+  record("evento", "cmd_ok", id);
+  if (doReboot) {
+    record("cmd", "reboot", 0, false);
+    xSemaphoreTake(fsMux, portMAX_DELAY);
+    cur.flush();
+    xSemaphoreGive(fsMux);
+    ESP.restart();
+  }
+}
 
 // reconexao rapida depois da pausa: o ELM continua alimentado e configurado
 bool quickResume() {
@@ -574,6 +708,8 @@ void pauseAndUpload() {
   if (n < 0) {  // rede sem internet (ex.: portal cativo): solta para tentar outra na proxima
     record("evento", "envio_falhou", 0, false);
     WiFi.disconnect(false);
+  } else {
+    fetchCommands();
   }
   btStart_();
   btOk = wasOk && quickResume();
@@ -596,7 +732,22 @@ void printStatus() {
 }
 
 void loop() {
+  static bool cfgLoaded = false;
+  if (!cfgLoaded) {  // ajustes salvos por comando remoto
+    cfgLoaded = true;
+    uint32_t s = prefs.getUInt("every", 0);
+    if (s) UPLOAD_EVERY_MS = s * 1000UL;
+    denySfx = prefs.isKey("deny") ? prefs.getString("deny") : String(DONGLE_DENY);
+    Serial.printf("[cfg] envio a cada %lu s, dongle ignorado: '%s'\n", UPLOAD_EVERY_MS / 1000, denySfx.c_str());
+  }
   printStatus();
+  esp_task_wdt_reset();
+  // batimento a cada minuto, com ou sem dongle: mostra que o laco esta vivo
+  if (millis() - lastMeta > 60000) {
+    lastMeta = millis();
+    record("meta", "heap", ESP.getFreeHeap());
+    record("meta", "wifi_rssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+  }
   if (!ntpDone && epochMs()) {
     ntpDone = true;
     record("meta", "ntp", (double)(epochMs() / 1000));
@@ -644,11 +795,6 @@ void loop() {
 #ifndef SIM_OBD
     BT.disconnect();
 #endif
-  }
-  if (millis() - lastMeta > 60000) {
-    lastMeta = millis();
-    record("meta", "heap", ESP.getFreeHeap());
-    record("meta", "wifi_rssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
   }
   printStatus();
 }
