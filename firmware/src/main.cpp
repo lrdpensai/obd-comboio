@@ -435,6 +435,20 @@ bool elmInit() {
 
 void probe() {
   nFast = nSlow = 0;
+  // Lista de sinais ja sondada neste carro: reaproveita (cada reconexao apos um envio
+  // custaria ate 2,5 s por sinal morto). "forget" ou dongle novo refazem a sondagem.
+  uint32_t mask = prefs.getUInt("supmask", 0);
+  if (mask && prefs.getUInt("supnp", 0) == (uint32_t)NP) {
+    for (int i = 0; i < NP; i++) {
+      sup[i] = mask & (1UL << i);
+      if (sup[i]) {
+        if (PIDS[i].fast) fastIdx[nFast++] = i;
+        else slowIdx[nSlow++] = i;
+      }
+    }
+    record("meta", "sinais_cache", nFast + nSlow);
+    return;
+  }
   for (int i = 0; i < NP; i++) {
     double v;
     String r = elm((String("01") + PIDS[i].id).c_str(), 2500);
@@ -447,6 +461,13 @@ void probe() {
     }
   }
   record("meta", "sinais", nFast + nSlow);
+  uint32_t m = 0;
+  for (int i = 0; i < NP; i++)
+    if (sup[i]) m |= 1UL << i;
+  if (m) {
+    prefs.putUInt("supmask", m);
+    prefs.putUInt("supnp", NP);
+  }
 }
 
 // Varredura so leitura, igual a do sweep.py do PC: com cabecalho (ATH1) para separar as ECUs,
@@ -642,6 +663,41 @@ void wifiTask(void*) {
   }
 }
 
+// ------------------------------------------------------------------ boot so de envio
+// Parar e religar o Bluetooth classico na mesma execucao travou o ESP em campo (18/11: travou logo
+// apos o primeiro envio, varias vezes). Agora o envio acontece num boot proprio, sem Bluetooth:
+// o laco normal marca a RTC e reinicia; o boot de envio sobe a fila com toda a memoria livre,
+// busca comandos e reinicia de novo no modo normal. A fila e a sessao (bootNo) atravessam o reinicio.
+RTC_NOINIT_ATTR uint32_t rtcMagic;
+RTC_NOINIT_ATTR uint32_t rtcSession;
+const uint32_t UPLOAD_MAGIC = 0xC0B0A1E5;
+void fetchCommands();
+
+void runUploadBoot() {
+  Serial.println("[envio] boot so de envio (sem Bluetooth)");
+  esp_task_wdt_init(120, true);  // envio travado -> reinicia (a fila fica)
+  esp_task_wdt_add(nullptr);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  for (auto& n : WIFI_NETS) wifiMulti.addAP(n.ssid, n.pass[0] ? n.pass : nullptr);
+  uint32_t t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 20000) wifiMulti.run(5000);
+  int n = -1;
+  if (WiFi.status() == WL_CONNECTED) {
+    logWifi();
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    n = uploadBatch(60);
+    if (n >= 0) fetchCommands();
+  }
+  record("evento", "envio_boot", n);
+  record("meta", "envio_ms", millis() - t);
+  xSemaphoreTake(fsMux, portMAX_DELAY);
+  cur.flush();
+  xSemaphoreGive(fsMux);
+  Serial.printf("[envio] %d arquivos em %lu ms, voltando ao modo normal\n", n, millis() - t);
+  ESP.restart();
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(LED, OUTPUT);
@@ -658,8 +714,15 @@ void setup() {
     }
     Serial.println("[bt] dongle salvo esquecido (BOOT)");
   }
-  bootNo = prefs.getUInt("boot", 0) + 1;
-  prefs.putUInt("boot", bootNo);
+  bool uploadBoot = (rtcMagic == UPLOAD_MAGIC) && rtcSession;
+  rtcMagic = 0;
+  if (uploadBoot) {
+    bootNo = rtcSession;  // mesma sessao (mesmo blob) do modo normal que pediu o envio
+  } else {
+    bootNo = prefs.getUInt("boot", 0) + 1;
+    prefs.putUInt("boot", bootNo);
+    rtcSession = bootNo;
+  }
   uint8_t m[6];
   WiFi.macAddress(m);
   char t[8];
@@ -681,6 +744,7 @@ void setup() {
   }
   qOpen();
   lastRotate = millis();
+  if (uploadBoot) runUploadBoot();  // nao volta: reinicia no modo normal
   Serial.printf("\n[comboio] %s boot %u mac %s  fs %u/%u KB\n", DEVICE_LABEL, (unsigned)bootNo, macTag.c_str(),
                 (unsigned)(LittleFS.usedBytes() / 1024), (unsigned)(LittleFS.totalBytes() / 1024));
   record("meta", "inicio", bootNo);
@@ -767,9 +831,11 @@ void fetchCommands() {
       record("cmd", "deny", d.length());
     } else if (c == "forget") {
       prefs.remove("obdaddr");
+      prefs.remove("supmask");
       record("cmd", "forget", 0, false);
     } else if (c == "sweep") {
       sweepPending = true;
+      prefs.putBool("sweepreq", true);  // sobrevive ao reinicio do boot de envio
       record("cmd", "sweep", 0, false);
     } else if (c == "reboot") {
       doReboot = true;
@@ -815,30 +881,16 @@ void pauseAndUpload() {
   bool pendente = qc || curBytes;
   xSemaphoreGive(fsMux);
   if (!pendente) return;
-  bool wasOk = btOk;
-  uint32_t t0 = millis();
+  // envio num boot proprio, sem Bluetooth (ver runUploadBoot)
   record("evento", "pausa_envio", qc);
-  btStop_();
-  Serial.printf("[mem] BT parado: heap %u, maior bloco %u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-  if (ESP.getMaxAllocHeap() < 30000) {  // memoria fragmentada: reinicia (a fila fica na flash)
-    record("evento", "reinicio_memoria", ESP.getMaxAllocHeap());
-    xSemaphoreTake(fsMux, portMAX_DELAY);
-    cur.flush();
-    xSemaphoreGive(fsMux);
-    ESP.restart();
-  }
-  int n = uploadBatch(40);
-  if (n < 0) {  // rede sem internet (ex.: portal cativo): solta para tentar outra na proxima
-    record("evento", "envio_falhou", 0, false);
-    WiFi.disconnect(false);
-  } else {
-    fetchCommands();
-  }
-  btStart_();
-  btOk = wasOk && quickResume();
-  record("evento", "retoma", n);
-  record("meta", "pausa_ms", millis() - t0);
-  Serial.printf("[envio] %d arquivos, pausa de %lu ms, obd=%d\n", n, millis() - t0, (int)btOk);
+  xSemaphoreTake(fsMux, portMAX_DELAY);
+  cur.flush();
+  xSemaphoreGive(fsMux);
+  rtcSession = bootNo;
+  rtcMagic = UPLOAD_MAGIC;
+  Serial.println("[envio] reiniciando no boot de envio");
+  delay(100);
+  ESP.restart();
 }
 
 void printStatus() {
@@ -863,6 +915,10 @@ void loop() {
     denySfx = prefs.isKey("deny") ? prefs.getString("deny") : String(DONGLE_DENY);
     // amarok_sweep: varre uma vez por gravacao do firmware (refeita se a anterior abortou)
     if (SWEEP_ON_CONNECT && prefs.getString("sweepbuild", "") != BUILD_ID) sweepPending = true;
+    if (prefs.getBool("sweepreq", false)) {
+      sweepPending = true;
+      prefs.remove("sweepreq");
+    }
     Serial.printf("[cfg] envio a cada %lu s, dongle ignorado: '%s'\n", UPLOAD_EVERY_MS / 1000, denySfx.c_str());
   }
   printStatus();
