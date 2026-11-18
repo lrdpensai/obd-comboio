@@ -19,8 +19,9 @@ python -m platformio run -e esp32dev -t upload --upload-port COM9
 
 ### No carro
 1. Dongle na porta OBD; ESP no powerbank.
-2. Primeira vez com a Starlink: o ESP abre a rede **comboio-esp** (senha `comboio123`). Conecte o celular
-   nela, escolha a rede da Starlink e digite a senha. Fica salvo.
+2. Wi‑Fi: as redes ficam em `secrets.h` (`WIFI_NETS`). O ESP conecta na de maior sinal, varre de novo
+   quando o sinal cai abaixo de −75 dBm ou quando o envio falha (rede sem internet), e sem rede guarda tudo
+   na flash até alguma voltar.
 3. LED piscando devagar = procurando o dongle; piscando rápido = lendo.
 4. Ao parar: desligar o carro, tirar o dongle (o pino 16 é alimentação permanente).
 
