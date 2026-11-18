@@ -119,6 +119,15 @@ void recordGps(double lat, double lon, double kmh, double alt, int sats, double 
   writeLine(line, n);
 }
 
+// linha com texto no lugar do valor (ex.: resposta crua da varredura): boot,ms,epoch_ms,tipo,nome,texto
+void recordText(const char* type, const char* name, const String& txt) {
+  char line[340];
+  int n = snprintf(line, sizeof line, "%u,%lu,%llu,%s,%s,%.290s\n", (unsigned)bootNo, millis(),
+                   (unsigned long long)epochMs(), type, name, txt.c_str());
+  if (n >= (int)sizeof line) n = sizeof line - 1;
+  writeLine(line, n);
+}
+
 static void writeLine(const char* line, int n) {
   xSemaphoreTake(fsMux, portMAX_DELAY);
   if (LittleFS.totalBytes() - LittleFS.usedBytes() < 48000) dropOldestLocked();
@@ -369,19 +378,33 @@ static String clean(String s) {
 struct Pid {
   const char* id;
   const char* name;
-  bool two;
+  uint8_t nb;   // bytes do valor (1, 2 ou 4)
   bool fast;
-  float mul, add;  // valor = (A ou 256A+B) * mul + add
+  float mul, add;  // valor = inteiro(nb bytes a partir de off) * mul + add
+  uint8_t off;     // bytes a pular (ex.: 0x87 traz um byte de suporte antes)
 };
+// Lista medida por varredura de resposta real (Hilux 2.8 D, 18/11); a sondagem no inicio
+// de cada conexao descarta o que o carro da vez nao responde.
 Pid PIDS[] = {
-    {"0C", "rpm", true, true, 0.25f, 0},       {"0D", "vel_obd", false, true, 1, 0},
-    {"04", "carga", false, true, 100 / 255.f, 0}, {"0B", "map", false, true, 1, 0},
-    {"10", "maf", true, true, 0.01f, 0},       {"49", "pedal", false, true, 100 / 255.f, 0},
-    {"11", "borboleta", false, false, 100 / 255.f, 0}, {"5E", "vazao_comb", true, false, 0.05f, 0},
-    {"05", "arrefec", false, false, 1, -40},   {"0F", "admissao", false, false, 1, -40},
-    {"46", "ambiente", false, false, 1, -40},  {"5C", "oleo", false, false, 1, -40},
-    {"33", "baro", false, false, 1, 0},        {"23", "rail", true, false, 10, 0},
-    {"2F", "tanque", false, false, 100 / 255.f, 0}, {"42", "tensao", true, false, 0.001f, 0},
+    {"0C", "rpm", 2, true, 0.25f, 0, 0},
+    {"0D", "vel_obd", 1, true, 1, 0, 0},
+    {"04", "carga", 1, true, 100 / 255.f, 0, 0},
+    {"49", "pedal", 1, true, 100 / 255.f, 0, 0},
+    {"10", "maf", 2, true, 0.01f, 0, 0},
+    {"87", "map", 2, true, 1 / 32.f, 0, 1},         // pressao do coletor (estendida), kPa
+    {"0B", "map_std", 1, true, 1, 0, 0},            // MAP padrao (gasolina); diesel costuma nao ter
+    {"9D", "comb_gs", 2, false, 0.02f, 0, 0},       // vazao de combustivel do motor, g/s
+    {"5E", "vazao_comb", 2, false, 0.05f, 0, 0},    // L/h (quando existir)
+    {"A6", "odometro", 4, false, 0.1f, 0, 0},       // km
+    {"05", "arrefec", 1, false, 1, -40, 0},
+    {"0F", "admissao", 1, false, 1, -40, 0},
+    {"33", "baro", 1, false, 1, 0, 0},
+    {"2F", "tanque", 1, false, 100 / 255.f, 0, 0},
+    {"46", "ambiente", 1, false, 1, -40, 0},
+    {"42", "tensao", 2, false, 0.001f, 0, 0},
+    {"5D", "injecao", 2, false, 1 / 128.f, -210, 0},  // avanco da injecao, graus
+    {"23", "rail", 2, false, 10, 0, 0},
+    {"1F", "tempo_motor", 2, false, 1, 0, 0},
 };
 const int NP = sizeof(PIDS) / sizeof(PIDS[0]);
 bool sup[NP];
@@ -391,12 +414,11 @@ bool parse(const Pid& p, const String& raw, double* out) {
   String s = clean(raw);
   int i = s.indexOf(String("41") + p.id);
   if (i < 0) return false;
-  String hex = s.substring(i + 4);
-  if ((int)hex.length() < (p.two ? 4 : 2)) return false;
-  int a = strtol(hex.substring(0, 2).c_str(), nullptr, 16);
-  int b = p.two ? strtol(hex.substring(2, 4).c_str(), nullptr, 16) : 0;
-  double raw_v = p.two ? 256.0 * a + b : a;
-  *out = raw_v * p.mul + p.add;
+  String hex = s.substring(i + 4 + 2 * p.off);
+  if ((int)hex.length() < 2 * p.nb) return false;
+  double v = 0;
+  for (int k = 0; k < p.nb; k++) v = v * 256 + strtol(hex.substring(2 * k, 2 * k + 2).c_str(), nullptr, 16);
+  *out = v * p.mul + p.add;
   return true;
 }
 
@@ -425,6 +447,79 @@ void probe() {
     }
   }
   record("meta", "sinais", nFast + nSlow);
+}
+
+// Varredura so leitura, igual a do sweep.py do PC: com cabecalho (ATH1) para separar as ECUs,
+// protocolo (ATDPN), mapas de suporte 0100..01E0, CADA PID 01..FF por resposta real e mode 09
+// (0902 VIN, 0904 calibracao, 0906 CVN, 090A nome da ECU). Cada resposta vira a linha
+// "sweep,<comando>,<ms>;<linhas cruas separadas por |>"; o sweep_azure.py remonta o JSON do sweep.py.
+// Com SWEEP_ON_CONNECT (env amarok_sweep) roda uma vez por gravacao do firmware; o comando remoto
+// "sweep" pede outra.
+#ifndef SWEEP_ON_CONNECT
+#define SWEEP_ON_CONNECT 0
+#endif
+static const char* BUILD_ID = __DATE__ " " __TIME__;
+volatile bool sweepPending = false;
+
+static String rawLines(const String& r) {  // "7E8 06 41 00 ..\r7E9 .." -> "7E8064100..|7E9.."
+  String o, l;
+  for (char ch : r) {
+    if (ch == '\r' || ch == '\n') {
+      if (l.length()) o += (o.length() ? "|" : "") + l;
+      l = "";
+    } else if (ch != ' ' && ch != '>') {
+      l += (char)toupper(ch);
+    }
+  }
+  if (l.length()) o += (o.length() ? "|" : "") + l;
+  return o;
+}
+
+// -1 = sem resposta (TIMEOUT), 0 = respondeu sem o esperado (NO DATA), 1 = gravou
+static int sweepCmd(const char* c, uint32_t to, const char* want) {
+  uint32_t t = millis();
+  String r = elm(c, to);
+  if (r == "TIMEOUT") return -1;
+  String o = rawLines(r);
+  if (want && o.indexOf(want) < 0) return 0;
+  recordText("sweep", c, String(millis() - t) + ";" + o);
+  Serial.printf("[sweep] %s -> %s\n", c, o.c_str());
+  return 1;
+}
+
+void sweep() {
+  uint32_t t0 = millis();
+  int tmo = 0, n = 0;
+  bool aborted = false;
+  record("evento", "sweep_inicio", 0, false);
+  elm("ATH1", 2000);
+  sweepCmd("ATDPN", 2000, nullptr);
+  for (int pid = 0; pid <= 0xFF && !aborted; pid++) {
+    esp_task_wdt_reset();
+    digitalWrite(LED, pid & 1);
+    char c[6], want[6];
+    snprintf(c, sizeof c, "01%02X", pid);
+    snprintf(want, sizeof want, "41%02X", pid);
+    int st = sweepCmd(c, pid % 0x20 ? 1500 : 4000, want);
+    if (st < 0) {
+      if (++tmo >= 6) aborted = true;  // dongle caiu no meio: desiste e deixa o laco reconectar
+    } else {
+      tmo = 0;
+      n += st;
+    }
+  }
+  const char* m09[] = {"0902", "0904", "0906", "090A"};
+  for (auto c : m09)
+    if (!aborted) {
+      esp_task_wdt_reset();
+      sweepCmd(c, 4000, "49");
+    }
+  elm("ATH0", 2000);
+  if (aborted) record("evento", "sweep_abortado", n);
+  else prefs.putString("sweepbuild", BUILD_ID);
+  record("meta", "sweep_respostas", n);
+  record("meta", "sweep_ms", millis() - t0);
+  Serial.printf("[sweep] %d respostas do mode 01 em %lu ms%s\n", n, millis() - t0, aborted ? " (abortada)" : "");
 }
 
 // ------------------------------------------------------------------ GPS (LC29H em RX2/GPIO16, 9600)
@@ -627,6 +722,7 @@ uint32_t UPLOAD_EVERY_MS = UPLOAD_EVERY_S * 1000UL;  // pausa o BT e envia (coma
 //   every <s>   intervalo de envio em segundos (30..900), fica salvo
 //   deny <xx:yy>  sufixo de endereco de dongle a ignorar, fica salvo ("deny -" limpa)
 //   forget      esquece o dongle salvo
+//   sweep       varre 0100..01FF uma vez, na proxima leitura (so leitura)
 //   reboot      reinicia
 void fetchCommands() {
   WiFiClientSecure cli;
@@ -672,6 +768,9 @@ void fetchCommands() {
     } else if (c == "forget") {
       prefs.remove("obdaddr");
       record("cmd", "forget", 0, false);
+    } else if (c == "sweep") {
+      sweepPending = true;
+      record("cmd", "sweep", 0, false);
     } else if (c == "reboot") {
       doReboot = true;
     } else {
@@ -762,6 +861,8 @@ void loop() {
     uint32_t s = prefs.getUInt("every", 0);
     if (s) UPLOAD_EVERY_MS = s * 1000UL;
     denySfx = prefs.isKey("deny") ? prefs.getString("deny") : String(DONGLE_DENY);
+    // amarok_sweep: varre uma vez por gravacao do firmware (refeita se a anterior abortou)
+    if (SWEEP_ON_CONNECT && prefs.getString("sweepbuild", "") != BUILD_ID) sweepPending = true;
     Serial.printf("[cfg] envio a cada %lu s, dongle ignorado: '%s'\n", UPLOAD_EVERY_MS / 1000, denySfx.c_str());
   }
   printStatus();
@@ -783,6 +884,10 @@ void loop() {
       btOk = true;
       timeouts = 0;
       record("evento", "obd_ok", 0, false);
+      if (sweepPending) {
+        sweepPending = false;
+        sweep();
+      }
       probe();
       lastGood = millis();
     } else {
@@ -793,6 +898,10 @@ void loop() {
       delay(5000);
       return;
     }
+  } else if (sweepPending) {  // pedido por comando remoto com o dongle ja conectado
+    sweepPending = false;
+    sweep();
+    lastGood = millis();
   }
 
   int list[NP + 1], n = 0;

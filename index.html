@@ -43,6 +43,7 @@ textarea{width:100%;height:120px;background:#11141a;color:var(--fg);border-radiu
     <button id="btnConn">Conectar dongle</button>
     <button id="btnDemo" class="sec">Simular</button>
   </div>
+  <button id="btnSweep" class="sec">Varrer PIDs (0100..01FF)</button>
   <div class="st"><span class="dot" id="dObd"></span><span id="tObd">Dongle desconectado</span></div>
   <div class="st"><span class="dot" id="dGps"></span><span id="tGps">GPS parado</span></div>
   <div class="st"><span class="dot" id="dWake"></span><span id="tWake">Tela: sem trava</span></div>
@@ -66,6 +67,9 @@ textarea{width:100%;height:120px;background:#11141a;color:var(--fg);border-radiu
   <div class="sub" id="expInfo"></div>
   <textarea id="expText" style="display:none" readonly></textarea>
 </div>
+
+<div class="card" id="sweepCard" style="display:none"><div class="sub">Varredura de PIDs</div>
+  <textarea id="sweepOut" readonly rows="12" style="width:100%"></textarea></div>
 
 <div class="card"><div class="sub">Tráfego do dongle (últimas linhas)</div><div id="log"></div></div>
 
@@ -101,6 +105,8 @@ let dev=null, txChar=null, rxBuf='', pending=null, running=false, demo=false;
 let supported=[], fastList=[], slowList=[], slowIdx=0;
 let last={}, rowsMem=[], nRows=0, t0=null, gpsWatch=null, wakeLock=null, lastFix=null;
 let cycleTimes=[];
+let sweeping=false, loopIdle=true;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const LOG=[];
 function log(s){LOG.push(new Date().toISOString().slice(11,19)+' '+s);if(LOG.length>60)LOG.shift();$('log').textContent=LOG.join('\n');}
 function setSt(d,t,cls,txt){$(d).className='dot '+(cls||'');$(t).textContent=txt;}
@@ -122,6 +128,12 @@ function addRow(type,name,val,g){
   const ts=Date.now(); const iso=new Date(ts).toISOString();
   const gp=g?[g.lat.toFixed(6),g.lon.toFixed(6),g.acc==null?'':Math.round(g.acc),g.alt==null?'':g.alt.toFixed(1),g.spd==null?'':(g.spd*3.6).toFixed(1)]:['','','','',''];
   rowsMem.push([ts,iso,type,name,val==null?'':(+val).toFixed(3).replace(/\.?0+$/,''),...gp,veh()].join(','));
+  nRows++; $('nrows').textContent=nRows;
+}
+// linha com texto cru no lugar do valor (ex.: resposta da varredura)
+function addRaw(type,name,txt){
+  const ts=Date.now();
+  rowsMem.push([ts,new Date(ts).toISOString(),type,name,String(txt).replace(/[,\n]/g,' '),'','','','','',veh()].join(','));
   nRows++; $('nrows').textContent=nRows;
 }
 setInterval(flush,4000);
@@ -204,12 +216,14 @@ async function onDisc(){
 // ---------- laço de leitura ----------
 async function loop(){
   while(running){
+    if(sweeping){loopIdle=true;await sleep(200);continue;}
+    loopIdle=false;
     if(!demo&&(!dev||!dev.gatt.connected)){await new Promise(r=>setTimeout(r,1000));continue;}
     const t=performance.now();
     const list=[...fastList]; if(slowList.length){list.push(slowList[slowIdx%slowList.length]);slowIdx++;}
     if(!list.length){await new Promise(r=>setTimeout(r,1000));continue;}
     for(const pid of list){
-      if(!running) break;
+      if(!running||sweeping) break;
       const r=await cmd('01'+pid,1500); const v=parse(pid,r);
       if(v!=null){last[pid]=v;addRow('obd',P[pid].n,v,lastFix);}
       else if(/TIMEOUT|ERRO/.test(r)) log('01'+pid+' '+r);
@@ -218,6 +232,43 @@ async function loop(){
     cycleTimes.push(performance.now()-t); if(cycleTimes.length>20) cycleTimes.shift();
     renderVals();
   }
+}
+// ---------- varredura completa do mode 01 (só leitura) ----------
+// Pergunta 0100..01FF, guarda a resposta crua de quem responde (tipo "sweep") e compara com os
+// mapas de suporte que a central declara (0100, 0120, ..., 01E0).
+async function sweep(){
+  if(sweeping) return;
+  if(!demo&&(!dev||!dev.gatt.connected)){alert('Conecte o dongle primeiro (ignição ligada).');return;}
+  sweeping=true; $('btnSweep').disabled=true;
+  while(running&&!loopIdle) await sleep(50);   // espera o laço soltar o dongle
+  const t0s=performance.now(), hx=n=>n.toString(16).toUpperCase().padStart(2,'0');
+  const resp={}, declared=new Set(); let tmo=0, aborted=null;
+  addRow('evento','sweep_inicio',null,lastFix); log('varredura 0100..01FF');
+  for(let n=0;n<=0xFF;n++){
+    const id=hx(n);
+    setSt('dObd','tObd','warn',`Varrendo 01${id} · ${Object.keys(resp).length} responderam`);
+    const r=await cmd('01'+id,1500); const s=clean(r).toUpperCase().replace(/\s/g,'');
+    const i=s.indexOf('41'+id);
+    if(i>=0){
+      resp[id]=s; addRaw('sweep','01'+id,s); log('01'+id+' → '+s); tmo=0;
+      if(n%32===0){ const bits=parseInt(s.slice(i+4,i+12),16);   // mapa de suporte: 32 bits
+        if(!isNaN(bits)) for(let b=0;b<32;b++) if(bits&(2**(31-b))) declared.add(hx(n+b+1)); }
+    }else if(/TIMEOUT|ERRO/.test(r)){ if(++tmo>=6){aborted=id;break;} }
+    else tmo=0;
+  }
+  const got=Object.keys(resp), ms=Math.round(performance.now()-t0s);
+  if(aborted) addRow('evento','sweep_abortado',parseInt(aborted,16),lastFix);
+  addRow('meta','sweep_respostas',got.length,null); addRow('meta','sweep_ms',ms,null); flush();
+  const nonMap=got.filter(p=>parseInt(p,16)%32!==0);
+  const out=[`${veh()||'carro'} · ${new Date().toISOString()} · ${got.length} respostas em ${(ms/1000).toFixed(0)} s`+(aborted?` · ABORTADA em 01${aborted} (dongle caiu)`:''),
+    `Declarados pela central (${declared.size}): ${[...declared].join(' ')}`,
+    `Responderam (${nonMap.length}): ${nonMap.join(' ')}`,
+    `Responderam sem estar declarados: ${nonMap.filter(p=>!declared.has(p)).join(' ')||'nenhum'}`,
+    `Declarados que não responderam: ${[...declared].filter(p=>!resp[p]&&parseInt(p,16)%32!==0).join(' ')||'nenhum'}`,
+    '', ...got.map(p=>`01${p} → ${resp[p]}`)];
+  $('sweepCard').style.display='block'; $('sweepOut').value=out.join('\n');
+  setSt('dObd','tObd',aborted?'bad':'ok',`Varredura: ${got.length} respostas`+(aborted?' (abortada)':''));
+  sweeping=false; $('btnSweep').disabled=false;
 }
 function renderTiles(){ $('vals').innerHTML=supported.map(p=>`<div class="kv"><span>${P[p].n} (${P[p].u})</span><b id="v${p}">—</b></div>`).join(''); }
 function renderVals(){
@@ -277,6 +328,7 @@ function fake(c){
 
 // ---------- botões ----------
 $('btnConn').onclick=()=>{demo=false;connect();};
+$('btnSweep').onclick=()=>sweep();
 $('btnDemo').onclick=async()=>{demo=true;setSt('dObd','tObd','warn','Simulação');await probe();setSt('dObd','tObd','ok','Simulação · '+supported.length+' sinais');startAll();};
 $('btnStop').onclick=()=>{running=false;flush();if(gpsWatch!=null)navigator.geolocation.clearWatch(gpsWatch);if(wakeLock)wakeLock.release();
   try{dev&&dev.gatt.connected&&dev.gatt.disconnect();}catch(_){}
