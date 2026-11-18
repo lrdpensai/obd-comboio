@@ -274,6 +274,16 @@ static bool denied(const uint8_t* a) {
   return d.length() && addrStr(a).endsWith(d);
 }
 static bool tryAddr(uint8_t* a) {
+  // 1o: SPP sem autenticacao (como o Car Scanner). Nao pareia, entao nao troca a unica
+  // link key que o clone guarda — parear aqui quebraria o pareamento do celular com o dongle.
+  esp_task_wdt_reset();
+  Serial.printf("[bt] conectando %s sem pareamento...\n", addrStr(a).c_str());
+  if (BT.connect(a, 0, ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER)) {
+    char nm[20];
+    snprintf(nm, sizeof nm, "dongle_%02X%02X", a[4], a[5]);
+    record("evento", nm, 1);
+    return true;
+  }
   for (auto pin : PINS_BT) {
     esp_task_wdt_reset();
     BT.setPin(pin);
