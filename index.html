@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Gravador OBD</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--fg:#e8eaf0;--mut:#9aa1ad;--ok:#3ecf8e;--warn:#f5b041;--bad:#ef5350;--acc:#5aa9ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 -apple-system,system-ui,sans-serif;padding:12px 16px 40px}
+h1{font-size:20px;margin:4px 0 2px}
+.sub{color:var(--mut);font-size:13px;margin-bottom:12px}
+.card{background:var(--card);border-radius:12px;padding:12px;margin:10px 0}
+button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:14px 12px;width:100%;margin:6px 0;background:var(--acc);color:#04121f}
+button.sec{background:#2a2f3a;color:var(--fg)}
+button.bad{background:var(--bad);color:#fff}
+button:disabled{opacity:.4}
+.row{display:flex;gap:8px}.row>*{flex:1}
+.st{display:flex;align-items:center;gap:8px;font-weight:600}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--mut);flex:none}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.kv{background:#11141a;border-radius:8px;padding:8px}
+.kv b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
+.kv span{color:var(--mut);font-size:12px}
+#log{font:11px/1.35 ui-monospace,monospace;color:var(--mut);white-space:pre-wrap;max-height:180px;overflow:auto}
+.big{font-size:28px;font-weight:700;font-variant-numeric:tabular-nums}
+.warnbox{background:#3a2a0a;color:#ffd68a;border-radius:10px;padding:10px;font-size:14px}
+input{font:inherit;width:100%;padding:10px;border-radius:8px;border:1px solid #333;background:#11141a;color:var(--fg)}
+textarea{width:100%;height:120px;background:#11141a;color:var(--fg);border-radius:8px}
+</style>
+</head>
+<body>
+<h1>Gravador OBD · comboio</h1>
+<div class="sub">Lê o dongle ELM327 Bluetooth LE e o GPS do celular e guarda tudo neste aparelho. Só leitura: nada é escrito no carro.</div>
+
+<div class="warnbox" id="envWarn">Verificando o navegador…</div>
+
+<div class="card">
+  <label class="sub" for="veh">Veículo / motorista</label>
+  <input id="veh" placeholder="ex.: Amarok" value="">
+  <div class="row">
+    <button id="btnConn">Conectar dongle</button>
+    <button id="btnDemo" class="sec">Simular</button>
+  </div>
+  <div class="st"><span class="dot" id="dObd"></span><span id="tObd">Dongle desconectado</span></div>
+  <div class="st"><span class="dot" id="dGps"></span><span id="tGps">GPS parado</span></div>
+  <div class="st"><span class="dot" id="dWake"></span><span id="tWake">Tela: sem trava</span></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div><span class="sub">Gravando há</span><div class="big" id="elapsed">00:00:00</div></div>
+    <div><span class="sub">Linhas guardadas</span><div class="big" id="nrows">0</div></div>
+  </div>
+  <div class="sub" id="rate">—</div>
+  <div class="grid" id="vals"></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="btnExport">Exportar CSV</button>
+    <button id="btnStop" class="sec">Parar</button>
+  </div>
+  <button id="btnNew" class="bad">Apagar e começar viagem nova</button>
+  <div class="sub" id="expInfo"></div>
+  <textarea id="expText" style="display:none" readonly></textarea>
+</div>
+
+<div class="card"><div class="sub">Tráfego do dongle (últimas linhas)</div><div id="log"></div></div>
+
+<script>
+'use strict';
+// ---------- PIDs (mode 01) ----------
+const P = {
+  '0C':{n:'rpm',u:'rpm',f:(a,b)=>(256*a+b)/4,fast:1},
+  '0D':{n:'vel_obd',u:'km/h',f:a=>a,fast:1},
+  '04':{n:'carga',u:'%',f:a=>a*100/255,fast:1},
+  '0B':{n:'map',u:'kPa',f:a=>a,fast:1},
+  '10':{n:'maf',u:'g/s',f:(a,b)=>(256*a+b)/100,fast:1},
+  '49':{n:'pedal',u:'%',f:a=>a*100/255,fast:1},
+  '11':{n:'borboleta',u:'%',f:a=>a*100/255},
+  '5E':{n:'vazao_comb',u:'L/h',f:(a,b)=>(256*a+b)/20},
+  '05':{n:'arrefec',u:'°C',f:a=>a-40},
+  '0F':{n:'admissao',u:'°C',f:a=>a-40},
+  '46':{n:'ambiente',u:'°C',f:a=>a-40},
+  '5C':{n:'oleo',u:'°C',f:a=>a-40},
+  '33':{n:'baro',u:'kPa',f:a=>a},
+  '23':{n:'rail',u:'kPa',f:(a,b)=>(256*a+b)*10},
+  '2F':{n:'tanque',u:'%',f:a=>a*100/255},
+  '42':{n:'tensao',u:'V',f:(a,b)=>(256*a+b)/1000},
+  '1F':{n:'tempo_motor',u:'s',f:(a,b)=>256*a+b},
+};
+const TWO = new Set(['0C','10','5E','23','42','1F']);
+// UUIDs usados por dongles ELM327 BLE comuns
+const SVC = [0xfff0,0xffe0,0x18f0,0xffb0,'e7810a71-73ae-499d-8c15-faa9aef0c3f2','0000fff0-0000-1000-8000-00805f9b34fb'];
+
+// ---------- estado ----------
+const $ = id=>document.getElementById(id);
+let dev=null, txChar=null, rxBuf='', pending=null, running=false, demo=false;
+let supported=[], fastList=[], slowList=[], slowIdx=0;
+let last={}, rowsMem=[], nRows=0, t0=null, gpsWatch=null, wakeLock=null, lastFix=null;
+let cycleTimes=[];
+const LOG=[];
+function log(s){LOG.push(new Date().toISOString().slice(11,19)+' '+s);if(LOG.length>60)LOG.shift();$('log').textContent=LOG.join('\n');}
+function setSt(d,t,cls,txt){$(d).className='dot '+(cls||'');$(t).textContent=txt;}
+
+// ---------- armazenamento (IndexedDB, sobrevive a recarregar) ----------
+let db;
+function openDb(){return new Promise((res,rej)=>{const r=indexedDB.open('obd-comboio',1);
+  r.onupgradeneeded=()=>r.result.createObjectStore('chunks',{autoIncrement:true});
+  r.onsuccess=()=>{db=r.result;res()};r.onerror=()=>rej(r.error);});}
+function flush(){ if(!db||!rowsMem.length) return; const chunk=rowsMem.join('\n'); rowsMem=[];
+  const tx=db.transaction('chunks','readwrite'); tx.objectStore('chunks').add(chunk); }
+function allChunks(){return new Promise(res=>{const out=[];const c=db.transaction('chunks').objectStore('chunks').openCursor();
+  c.onsuccess=e=>{const cur=e.target.result;if(cur){out.push(cur.value);cur.continue();}else res(out);};});}
+function countRows(){return allChunks().then(ch=>ch.reduce((n,c)=>n+(c?c.split('\n').length:0),0));}
+function clearDb(){return new Promise(res=>{const tx=db.transaction('chunks','readwrite');tx.objectStore('chunks').clear();tx.oncomplete=res;});}
+const HEADER='ts_ms,iso,tipo,nome,valor,lat,lon,prec_m,alt_m,vel_gps_kmh,veiculo';
+function veh(){return ($('veh').value||'').replace(/[,\n]/g,' ');}
+function addRow(type,name,val,g){
+  const ts=Date.now(); const iso=new Date(ts).toISOString();
+  const gp=g?[g.lat.toFixed(6),g.lon.toFixed(6),g.acc==null?'':Math.round(g.acc),g.alt==null?'':g.alt.toFixed(1),g.spd==null?'':(g.spd*3.6).toFixed(1)]:['','','','',''];
+  rowsMem.push([ts,iso,type,name,val==null?'':(+val).toFixed(3).replace(/\.?0+$/,''),...gp,veh()].join(','));
+  nRows++; $('nrows').textContent=nRows;
+}
+setInterval(flush,4000);
+
+// ---------- BLE / ELM327 ----------
+async function connect(){
+  try{
+    dev = await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:SVC});
+    dev.addEventListener('gattserverdisconnected', onDisc);
+    await gattUp();
+    startAll();
+  }catch(e){ log('ERRO conectar: '+e.message); setSt('dObd','tObd','bad','Falhou: '+e.message); }
+}
+async function gattUp(){
+  setSt('dObd','tObd','warn','Conectando a '+(dev.name||'dongle')+'…');
+  const srv = await dev.gatt.connect();
+  let notify=null, write=null;
+  for(const s of SVC){
+    let svc; try{svc=await srv.getPrimaryService(s);}catch(_){continue;}
+    const chars=await svc.getCharacteristics();
+    for(const c of chars){
+      if(!notify&&(c.properties.notify||c.properties.indicate)) notify=c;
+      if(!write&&(c.properties.write||c.properties.writeWithoutResponse)) write=c;
+    }
+    if(notify&&write){log('serviço '+svc.uuid);break;}
+  }
+  if(!notify||!write) throw new Error('dongle sem canal serial BLE conhecido');
+  txChar=write;
+  await notify.startNotifications();
+  notify.addEventListener('characteristicvaluechanged',ev=>{
+    rxBuf+=new TextDecoder().decode(ev.target.value);
+    if(rxBuf.includes('>')&&pending){const r=rxBuf.split('>')[0];rxBuf='';const p=pending;pending=null;clearTimeout(p.to);p.res(r);}
+  });
+  setSt('dObd','tObd','warn','Iniciando ELM327…');
+  for(const c of ['ATZ','ATE0','ATL0','ATS0','ATH0','ATAT1','ATSP0']){const r=await cmd(c,c==='ATZ'?4000:2000);log(c+' → '+clean(r));}
+  const r0=await cmd('0100',12000); log('0100 → '+clean(r0));
+  if(!/4100/.test(clean(r0).replace(/\s/g,''))) log('aviso: 0100 sem resposta (ignição ligada?)');
+  await probe();
+  setSt('dObd','tObd','ok',(dev.name||'Dongle')+' · '+supported.length+' sinais');
+}
+function clean(s){return (s||'').replace(/\r/g,' ').replace(/\s+/g,' ').trim();}
+function cmd(c,ms=1500){
+  if(demo) return Promise.resolve(fake(c));
+  return new Promise(async res=>{
+    rxBuf=''; const p={res}; p.to=setTimeout(()=>{if(pending===p){pending=null;res('TIMEOUT');}},ms); pending=p;
+    try{ const data=new TextEncoder().encode(c+'\r');
+      if(txChar.properties.writeWithoutResponse) await txChar.writeValueWithoutResponse(data); else await txChar.writeValue(data);
+    }catch(e){ clearTimeout(p.to); pending=null; res('ERRO '+e.message); }
+  });
+}
+function parse(pid,raw){
+  const s=clean(raw).toUpperCase().replace(/\s/g,'');
+  const i=s.indexOf('41'+pid); if(i<0) return null;
+  const hex=s.slice(i+4); const a=parseInt(hex.slice(0,2),16), b=parseInt(hex.slice(2,4),16);
+  if(isNaN(a)) return null; if(TWO.has(pid)&&isNaN(b)) return null;
+  return P[pid].f(a,b||0);
+}
+async function probe(){
+  supported=[];
+  for(const pid of Object.keys(P)){
+    const r=await cmd('01'+pid,2500); const v=parse(pid,r);
+    log('01'+pid+' '+P[pid].n+' → '+(v==null?'não responde':v.toFixed(1)));
+    if(v!=null) supported.push(pid);
+  }
+  fastList=supported.filter(p=>P[p].fast); slowList=supported.filter(p=>!P[p].fast);
+  addRow('meta','sinais',supported.length,null);
+  rowsMem.push(['','', 'meta','lista',supported.map(p=>P[p].n).join('|')].join(','));
+  renderTiles();
+}
+async function onDisc(){
+  log('dongle desconectou'); setSt('dObd','tObd','bad','Dongle caiu — reconectando…'); addRow('evento','desconectou',null,lastFix);
+  pending=null;
+  for(let i=1;running&&i<=1000;i++){
+    await new Promise(r=>setTimeout(r,Math.min(15000,2000*i)));
+    try{ await gattUp(); addRow('evento','reconectou',i,lastFix); log('reconectou'); return; }
+    catch(e){ log('tentativa '+i+': '+e.message); }
+  }
+}
+
+// ---------- laço de leitura ----------
+async function loop(){
+  while(running){
+    if(!demo&&(!dev||!dev.gatt.connected)){await new Promise(r=>setTimeout(r,1000));continue;}
+    const t=performance.now();
+    const list=[...fastList]; if(slowList.length){list.push(slowList[slowIdx%slowList.length]);slowIdx++;}
+    if(!list.length){await new Promise(r=>setTimeout(r,1000));continue;}
+    for(const pid of list){
+      if(!running) break;
+      const r=await cmd('01'+pid,1500); const v=parse(pid,r);
+      if(v!=null){last[pid]=v;addRow('obd',P[pid].n,v,lastFix);}
+      else if(/TIMEOUT|ERRO/.test(r)) log('01'+pid+' '+r);
+      if(demo) await new Promise(r=>setTimeout(r,60));
+    }
+    cycleTimes.push(performance.now()-t); if(cycleTimes.length>20) cycleTimes.shift();
+    renderVals();
+  }
+}
+function renderTiles(){ $('vals').innerHTML=supported.map(p=>`<div class="kv"><span>${P[p].n} (${P[p].u})</span><b id="v${p}">—</b></div>`).join(''); }
+function renderVals(){
+  for(const p of supported){const e=$('v'+p); if(e&&last[p]!=null) e.textContent=last[p].toFixed(P[p].u==='rpm'||P[p].u==='km/h'?0:1);}
+  const avg=cycleTimes.reduce((a,b)=>a+b,0)/(cycleTimes.length||1);
+  $('rate').textContent=`Ciclo rápido a cada ${(avg/1000).toFixed(1)} s · ${supported.length} sinais`;
+}
+
+// ---------- GPS e tela ----------
+function startGps(){
+  if(!navigator.geolocation){setSt('dGps','tGps','bad','Sem GPS no navegador');return;}
+  gpsWatch=navigator.geolocation.watchPosition(p=>{
+    const c=p.coords; lastFix={lat:c.latitude,lon:c.longitude,acc:c.accuracy,alt:c.altitude,spd:c.speed};
+    addRow('gps','fix',c.speed==null?null:c.speed*3.6,lastFix);
+    setSt('dGps','tGps',c.accuracy<30?'ok':'warn','GPS ±'+Math.round(c.accuracy)+' m');
+  },e=>{setSt('dGps','tGps','bad','GPS: '+e.message);log('GPS '+e.message);},{enableHighAccuracy:true,maximumAge:0,timeout:20000});
+}
+async function wake(){
+  try{ wakeLock=await navigator.wakeLock.request('screen'); setSt('dWake','tWake','ok','Tela travada acesa');
+    wakeLock.addEventListener('release',()=>setSt('dWake','tWake','warn','Tela pode apagar — toque na página'));
+  }catch(e){ setSt('dWake','tWake','warn','Tela: deixe Bloqueio Automático em "Nunca"'); }
+}
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'&&running){wake();}
+  else if(running){addRow('evento','pagina_oculta',null,lastFix);flush();} });
+
+function startAll(){
+  running=true; if(!t0) t0=Date.now(); startGps(); wake(); addRow('evento','inicio',null,null); loop();
+}
+setInterval(()=>{ if(!t0) return; const s=Math.floor((Date.now()-t0)/1000);
+  $('elapsed').textContent=[s/3600|0,(s%3600)/60|0,s%60].map(x=>String(x).padStart(2,'0')).join(':'); },1000);
+
+// ---------- exportar ----------
+async function exportCsv(){
+  flush(); await new Promise(r=>setTimeout(r,300));
+  const chunks=await allChunks(); const body=chunks.filter(Boolean).join('\n');
+  const csv=HEADER+'\n'+body+'\n'; const name=`obd-${veh().split(' ')[0].toLowerCase()||'carro'}-${new Date().toISOString().slice(0,16).replace(/[:T]/g,'')}.csv`;
+  const lines=body?body.split('\n').length:0;
+  $('expInfo').textContent=`${lines} linhas · ${(csv.length/1024).toFixed(0)} KB · ${name}`;
+  const file=new File([csv],name,{type:'text/csv'});
+  try{ if(navigator.canShare&&navigator.canShare({files:[file]})){ await navigator.share({files:[file],title:name}); log('exportado por compartilhar'); return; } }catch(e){ log('compartilhar: '+e.message); }
+  try{ const a=document.createElement('a'); a.href=URL.createObjectURL(file); a.download=name; document.body.appendChild(a); a.click(); a.remove(); log('exportado por download'); }catch(e){ log('download: '+e.message); }
+  const ta=$('expText'); ta.style.display='block'; ta.value=csv; ta.select();
+  try{ await navigator.clipboard.writeText(csv); $('expInfo').textContent+=' · copiado para a área de transferência'; }catch(_){ $('expInfo').textContent+=' · selecione o texto abaixo e copie'; }
+}
+
+// ---------- simulação (testar sem carro) ----------
+let simT=0;
+function fake(c){
+  if(c.startsWith('AT')) return 'OK';
+  const pid=c.slice(2).toUpperCase(); if(!P[pid]) return 'NO DATA';
+  if(pid==='0B') return 'NO DATA'; // Amarok não responde MAP
+  simT+=0.05; const rpm=1500+700*Math.sin(simT), x=v=>v.toString(16).padStart(2,'0').toUpperCase();
+  const map={ '0C':()=>{const r=Math.round(rpm*4);return x(r>>8)+x(r&255)}, '0D':()=>x(Math.round(80+20*Math.sin(simT/3))),
+    '04':()=>x(Math.round(90+60*Math.sin(simT))), '05':()=>x(128), '0F':()=>x(70), '33':()=>x(92), '10':()=>'0F'+'A0' };
+  const h=(map[pid]||(()=>x(100)+x(0)))(); return '41'+pid+h;
+}
+
+// ---------- botões ----------
+$('btnConn').onclick=()=>{demo=false;connect();};
+$('btnDemo').onclick=async()=>{demo=true;setSt('dObd','tObd','warn','Simulação');await probe();setSt('dObd','tObd','ok','Simulação · '+supported.length+' sinais');startAll();};
+$('btnStop').onclick=()=>{running=false;flush();if(gpsWatch!=null)navigator.geolocation.clearWatch(gpsWatch);if(wakeLock)wakeLock.release();
+  try{dev&&dev.gatt.connected&&dev.gatt.disconnect();}catch(_){}
+  setSt('dObd','tObd','','Parado (dados guardados)');setSt('dGps','tGps','','GPS parado');};
+$('btnNew').onclick=async()=>{ if(!confirm('Apagar TODOS os dados guardados neste celular? Exporte antes.')) return;
+  await clearDb(); rowsMem=[]; nRows=0; t0=null; $('nrows').textContent='0'; $('expInfo').textContent='Apagado.'; };
+
+// ---------- início ----------
+(async()=>{
+  await openDb(); nRows=await countRows(); $('nrows').textContent=nRows;
+  const w=[];
+  if(!navigator.bluetooth) w.push('Este navegador não tem Bluetooth. No iPhone, abra esta página no app Bluefy (App Store). No Android, use o Chrome.');
+  if(!window.isSecureContext) w.push('A página precisa abrir por https.');
+  w.push('Antes de sair: Ajustes › Tela e Brilho › Bloqueio Automático › Nunca. Celular no carregador e esta página aberta na frente o tempo todo.');
+  if(nRows) w.push(nRows+' linhas de uma gravação anterior estão guardadas. Exporte antes de apagar.');
+  $('envWarn').innerHTML=w.map(s=>'• '+s).join('<br>');
+  if(location.search.includes('demo')) $('btnDemo').click();
+})();
+</script>
+</body>
+</html>
