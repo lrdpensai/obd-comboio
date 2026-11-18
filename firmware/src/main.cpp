@@ -268,7 +268,19 @@ static String addrStr(const uint8_t* a) {
   snprintf(b, sizeof b, "%02X:%02X:%02X:%02X:%02X:%02X", a[0], a[1], a[2], a[3], a[4], a[5]);
   return b;
 }
+// Dongle da Amarok: 00:10:CC:4F:36:03 (classico + BLE). O da Hilux (AA:BB:CC:11:22:33) nunca.
+#ifndef DONGLE_ADDR
+#define DONGLE_ADDR "00:10:CC:4F:36:03"
+#endif
+static bool parseAddr(const char* s, uint8_t* out) {
+  unsigned v[6];
+  if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) out[i] = (uint8_t)v[i];
+  return true;
+}
 static bool denied(const uint8_t* a) {
+  uint8_t only[6];
+  if (parseAddr(DONGLE_ADDR, only) && memcmp(a, only, 6) != 0) return true;  // so o dongle da Amarok
   String d = denySfx;
   d.toUpperCase();
   return d.length() && addrStr(a).endsWith(d);
@@ -300,6 +312,8 @@ static bool tryAddr(uint8_t* a) {
 
 bool btConnect() {
   uint8_t addr[6];
+  // endereco conhecido do dongle da Amarok: conecta direto, sem varredura
+  if (parseAddr(DONGLE_ADDR, addr) && tryAddr(addr)) return true;
   // endereco salvo de uma conexao anterior: tenta direto
   if (prefs.getBytes("obdaddr", addr, 6) == 6 && !denied(addr)) {
     if (tryAddr(addr)) return true;
