@@ -10,7 +10,7 @@
 #include <BluetoothSerial.h>
 #include <esp_bt.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
+#include <WiFiMulti.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
@@ -22,7 +22,9 @@
 
 BluetoothSerial BT;
 Preferences prefs;
-WiFiManager wm;
+WiFiMulti wifiMulti;
+volatile bool wifiBusy = false;
+int lastNet = 0;
 SemaphoreHandle_t fsMux;
 
 uint32_t bootNo = 0;
@@ -350,10 +352,28 @@ void btStop_() {
 }
 
 // ------------------------------------------------------------------ setup/loop
+// registra troca de rede (wifi_1 / wifi_2, sem o nome da rede nos dados)
+void logWifi() {
+  int idx = 0;
+  if (WiFi.status() == WL_CONNECTED)
+    for (int i = 0; i < (int)(sizeof(WIFI_NETS) / sizeof(WIFI_NETS[0])); i++)
+      if (WiFi.SSID() == WIFI_NETS[i].ssid) idx = i + 1;
+  if (idx != lastNet) {
+    lastNet = idx;
+    Serial.printf("[wifi] rede %d %s %d dBm\n", idx, idx ? WiFi.SSID().c_str() : "-", idx ? WiFi.RSSI() : 0);
+    char nm[12];
+    snprintf(nm, sizeof nm, "wifi_%d", idx);
+    record("evento", nm, idx ? WiFi.RSSI() : 0);
+  }
+}
+
+// reconecta sozinho na melhor rede conhecida (maior sinal)
 void wifiTask(void*) {
   for (;;) {
-    wm.process();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    if (!wifiBusy && WiFi.status() != WL_CONNECTED) wifiMulti.run(8000);
+    if (!wifiBusy) logWifi();
+    // sem rede: varre a cada 30 s (a varredura atrapalha o Bluetooth do dongle)
+    vTaskDelay(pdMS_TO_TICKS(WiFi.status() == WL_CONNECTED ? 4000 : 30000));
   }
 }
 
@@ -389,12 +409,13 @@ void setup() {
                 (unsigned)(LittleFS.usedBytes() / 1024), (unsigned)(LittleFS.totalBytes() / 1024));
   record("meta", "inicio", bootNo);
 
-  // Wi-Fi: credenciais salvas; sem elas, abre o portal "comboio-esp" (senha comboio123)
+  // Wi-Fi: redes de secrets.h; conecta na de maior sinal e troca quando enfraquece
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
-  wm.setConfigPortalBlocking(false);
-  wm.setConnectTimeout(20);
-  wm.autoConnect("comboio-esp", "comboio123");
+  for (auto& n : WIFI_NETS) wifiMulti.addAP(n.ssid, n.pass[0] ? n.pass : nullptr);
+  wifiMulti.run(10000);
+  logWifi();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   xTaskCreatePinnedToCore(wifiTask, "wifi", 6144, nullptr, 1, nullptr, 0);
 
@@ -426,6 +447,14 @@ bool quickResume() {
 
 void pauseAndUpload() {
   lastUpload = millis();
+  // handoff: sem rede ou sinal fraco -> varre e fica com a melhor rede conhecida
+  if (WiFi.status() != WL_CONNECTED || WiFi.RSSI() < -75) {
+    wifiBusy = true;
+    if (WiFi.status() == WL_CONNECTED) WiFi.disconnect(false);
+    wifiMulti.run(8000);
+    wifiBusy = false;
+    logWifi();
+  }
   if (WiFi.status() != WL_CONNECTED) return;
   int qc;
   xSemaphoreTake(fsMux, portMAX_DELAY);
@@ -446,6 +475,10 @@ void pauseAndUpload() {
     ESP.restart();
   }
   int n = uploadBatch(40);
+  if (n < 0) {  // rede sem internet (ex.: portal cativo): solta para tentar outra na proxima
+    record("evento", "envio_falhou", 0, false);
+    WiFi.disconnect(false);
+  }
   btStart_();
   btOk = wasOk && quickResume();
   record("evento", "retoma", n);
