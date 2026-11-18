@@ -97,6 +97,8 @@ static void dropOldestLocked() {
   }
 }
 
+static void writeLine(const char* line, int n);
+
 void record(const char* type, const char* name, double v, bool hasV = true) {
   char line[112];
   uint64_t e = epochMs();
@@ -104,6 +106,18 @@ void record(const char* type, const char* name, double v, bool hasV = true) {
                           (unsigned long long)e, type, name, v)
                : snprintf(line, sizeof line, "%u,%lu,%llu,%s,%s,\n", (unsigned)bootNo, millis(),
                           (unsigned long long)e, type, name);
+  writeLine(line, n);
+}
+
+// linha de GPS: boot,ms,epoch_ms,gps,lat,lon,kmh,alt_m,sats,hdop
+void recordGps(double lat, double lon, double kmh, double alt, int sats, double hdop) {
+  char line[128];
+  int n = snprintf(line, sizeof line, "%u,%lu,%llu,gps,%.6f,%.6f,%.1f,%.1f,%d,%.1f\n", (unsigned)bootNo, millis(),
+                   (unsigned long long)epochMs(), lat, lon, kmh, alt, sats, hdop);
+  writeLine(line, n);
+}
+
+static void writeLine(const char* line, int n) {
   xSemaphoreTake(fsMux, portMAX_DELAY);
   if (LittleFS.totalBytes() - LittleFS.usedBytes() < 48000) dropOldestLocked();
   if (cur) {
@@ -336,6 +350,85 @@ void probe() {
   record("meta", "sinais", nFast + nSlow);
 }
 
+// ------------------------------------------------------------------ GPS (LC29H em RX2/GPIO16, 9600)
+#define GPS_RX 16
+#define GPS_TX 17
+volatile int gpsSats = 0;
+volatile bool gpsFix = false;
+volatile uint32_t nGps = 0;
+
+static bool nmeaOk(const String& s) {  // confere o checksum *hh
+  int star = s.lastIndexOf('*');
+  if (star < 1 || star + 3 > (int)s.length()) return false;
+  uint8_t c = 0;
+  for (int i = 1; i < star; i++) c ^= (uint8_t)s[i];
+  return c == (uint8_t)strtol(s.substring(star + 1, star + 3).c_str(), nullptr, 16);
+}
+static int fields(const String& s, String* f, int max) {
+  int n = 0, start = 0;
+  for (int i = 0; i <= (int)s.length() && n < max; i++)
+    if (i == (int)s.length() || s[i] == ',' || s[i] == '*') {
+      f[n++] = s.substring(start, i);
+      start = i + 1;
+      if (i < (int)s.length() && s[i] == '*') break;
+    }
+  return n;
+}
+static double degMin(const String& v, const String& hemi) {  // ddmm.mmmm -> graus
+  if (!v.length()) return 0;
+  double x = v.toDouble();
+  int d = (int)(x / 100);
+  double g = d + (x - d * 100) / 60.0;
+  return (hemi == "S" || hemi == "W") ? -g : g;
+}
+
+void gpsTask(void*) {
+  String line, f[16];
+  double kmh = 0;
+  for (;;) {
+    while (Serial2.available()) {
+      char c = Serial2.read();
+      if (c == '\r') continue;
+      if (c != '\n') {
+        if (line.length() < 120) line += c;
+        continue;
+      }
+      if (line.length() > 6 && line[0] == '$' && nmeaOk(line)) {
+        String t = line.substring(3, 6);
+        int n = fields(line, f, 16);
+        if (t == "RMC" && n >= 10) {
+          kmh = f[7].toDouble() * 1.852;
+          // relogio pelo GPS quando ainda nao ha internet
+          if (f[2] == "A" && f[9].length() == 6 && f[1].length() >= 6 && !epochMs()) {
+            struct tm tm = {};
+            tm.tm_mday = f[9].substring(0, 2).toInt();
+            tm.tm_mon = f[9].substring(2, 4).toInt() - 1;
+            tm.tm_year = f[9].substring(4, 6).toInt() + 100;
+            tm.tm_hour = f[1].substring(0, 2).toInt();
+            tm.tm_min = f[1].substring(2, 4).toInt();
+            tm.tm_sec = f[1].substring(4, 6).toInt();
+            setenv("TZ", "UTC0", 1);
+            tzset();
+            struct timeval tv = {mktime(&tm), 0};
+            settimeofday(&tv, nullptr);
+            record("meta", "relogio_gps", (double)tv.tv_sec);
+          }
+        } else if (t == "GGA" && n >= 10) {
+          int q = f[6].toInt();
+          gpsSats = f[7].toInt();
+          gpsFix = q > 0;
+          if (gpsFix) {
+            recordGps(degMin(f[2], f[3]), degMin(f[4], f[5]), kmh, f[9].toDouble(), gpsSats, f[8].toDouble());
+            nGps++;
+          }
+        }
+      }
+      line = "";
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
 // ------------------------------------------------------------------ pilha Bluetooth
 void btStart_() {
 #ifndef SIM_OBD
@@ -418,6 +511,9 @@ void setup() {
   logWifi();
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   xTaskCreatePinnedToCore(wifiTask, "wifi", 6144, nullptr, 1, nullptr, 0);
+  Serial2.setRxBufferSize(1024);
+  Serial2.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  xTaskCreatePinnedToCore(gpsTask, "gps", 6144, nullptr, 2, nullptr, 0);
 
 #ifndef SIM_OBD
   // so Bluetooth classico: devolve a memoria do controlador BLE
@@ -486,7 +582,21 @@ void pauseAndUpload() {
   Serial.printf("[envio] %d arquivos, pausa de %lu ms, obd=%d\n", n, millis() - t0, (int)btOk);
 }
 
+void printStatus() {
+  if (millis() - lastStatus < 10000) return;
+  lastStatus = millis();
+  int qc;
+  xSemaphoreTake(fsMux, portMAX_DELAY);
+  scanQueue(nullptr, &qc);
+  xSemaphoreGive(fsMux);
+  Serial.printf("[status] obd=%d gps=%d sat=%d pts=%u linhas=%u enviados=%u falhas=%u fila=%d wifi=%s hora=%d heap=%u\n",
+                (int)btOk, (int)gpsFix, gpsSats, (unsigned)nGps, (unsigned)nLines, (unsigned)nSent, (unsigned)nFail, qc,
+                WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "-", (int)(epochMs() != 0),
+                ESP.getFreeHeap());
+}
+
 void loop() {
+  printStatus();
   if (!ntpDone && epochMs()) {
     ntpDone = true;
     record("meta", "ntp", (double)(epochMs() / 1000));
@@ -540,14 +650,5 @@ void loop() {
     record("meta", "heap", ESP.getFreeHeap());
     record("meta", "wifi_rssi", WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
   }
-  if (millis() - lastStatus > 10000) {
-    lastStatus = millis();
-    int qc;
-    xSemaphoreTake(fsMux, portMAX_DELAY);
-    scanQueue(nullptr, &qc);
-    xSemaphoreGive(fsMux);
-    Serial.printf("[status] linhas=%u enviados=%u falhas=%u fila=%d wifi=%s ntp=%d heap=%u\n", (unsigned)nLines,
-                  (unsigned)nSent, (unsigned)nFail, qc, WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "-",
-                  (int)ntpDone, ESP.getFreeHeap());
-  }
+  printStatus();
 }
